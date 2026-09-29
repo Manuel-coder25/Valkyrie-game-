@@ -4,11 +4,12 @@
   "description": "WhatsApp RPG economy game",
   "main": "index.js",
   "scripts": {
-    "start": "node index.js"
+    "start": "node index.js",
+    "test": "node tests/run-regressions.js"
   },
   "dependencies": {
     "@whiskeysockets/baileys": "^6.7.18",
-    "better-sqlite3": "^11.8.1",
-    "pino": "^9.6.0"
+    "pino": "^9.6.0",
+    "sql.js": "^1.14.2"
   }
 }
