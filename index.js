@@ -6,6 +6,7 @@ const {
 
 const {
     initDatabase,
+    createBounty, expireBounties, getBounty, listBounties, runGameplayAction,
     healPlayer,
     claimWork,
     casino,
@@ -60,6 +61,7 @@ const DAILY_REWARD = 1000;
 const DAILY_COOLDOWN = 24 * 60 * 60 * 1000;
 const ROB_COOLDOWN = 60 * 1000;
 let recoveryTimer;
+let bountyTimer;
 
 function recoveryText(player) {
     const seconds = Math.max(0, Math.ceil((Number(player.defeated_until) - Date.now()) / 1000));
@@ -142,10 +144,38 @@ async function resolveAttackIdentity(sock, id, chatId, alternateId) {
     };
 }
 
+// Collect reply data during the existing action transaction; send after durable save.
+async function persistMissionCommand(sock, chatId, senderJid, playerId, actionId, kind, operation) {
+    let result;
+    try {
+        result = runGameplayAction(playerId,kind,actionId,() => {
+            const replies = [];
+            const queueReply = (_sock,jid,text,mentions=[]) => replies.push({jid,playerJid:senderJid,text,mentions});
+            const queuePlayerReply = (_sock,jid,playerJid,text,mentions=[]) => replies.push({jid,playerJid,text,mentions});
+            operation(queueReply,queuePlayerReply);
+            return {success:true,replies};
+        });
+    } catch (error) {
+        console.error('Action could not be saved:',error);
+        return sendPlayerReply(sock,chatId,senderJid,'Action could not be saved. No changes were made. Try again.');
+    }
+    if (result.duplicate) return sendPlayerReply(sock,chatId,senderJid,'This action was already processed.');
+    if (!result.success) return sendPlayerReply(sock,chatId,senderJid,'Missing message ID. Send a new command.');
+    return Promise.allSettled(result.replies.map(reply =>
+        sendPlayerReply(sock,reply.jid,reply.playerJid,reply.text,reply.mentions)));
+}
+
 async function startBot() {
 
     await initDatabase();
     recoverPlayers();
+    if (!bountyTimer) {
+        bountyTimer = setInterval(() => {
+            try { expireBounties(); }
+            catch (error) { console.error('Bounty expiration failed:',error); }
+        }, 60000);
+        bountyTimer.unref();
+    }
     if (!recoveryTimer) {
         recoveryTimer = setInterval(() => {
             try { recoverPlayers(); }
@@ -600,11 +630,58 @@ Use *.menu* to view your commands.
                 */
 
                 if (!player) {
-                    if (CASINO_COMMANDS.has(command) || ["job", "jobs", "work", "medkit", "medic", "profile", "p", "health", "hp", "buy", "inventory", "inv"].includes(command)) return sendText(sock, jid, "Register first with .register.");
+                    if (CASINO_COMMANDS.has(command) || ["bounty", "bounties", "bountyinfo", "mybounties", "job", "jobs", "work", "medkit", "medic", "profile", "p", "health", "hp", "buy", "inventory", "inv"].includes(command)) return sendText(sock, jid, "Register first with .register.");
                     return;
                 }
 
                 const actionId = msg.key.id ? JSON.stringify([jid, userId, msg.key.id]) : null;
+                if (['bounty','bounties','bountyinfo','mybounties'].includes(command)) {
+                    try {
+                        expireBounties();
+                        if (command === 'bounty') {
+                            const mentioned = msg.message?.extendedTextMessage?.contextInfo?.mentionedJid?.[0];
+                            if (!mentioned || args.length !== 2) return sendText(sock,jid,'Use .bounty @player <whole dollar amount>.');
+                            const target = await resolveAttackIdentity(sock,mentioned,jid);
+                            // Retain the exact registered account, as the sender/equipment path does.
+                            const targetId = getPlayer(mentioned)?.id || target.id;
+                            const result = createBounty(userId,targetId,args[1],actionId,
+                                {creator:attackSender.canonicalId,target:target.canonicalId});
+                            if (!result.success) {
+                                const errors = {
+                                    INVALID_AMOUNT:'Use a whole-dollar amount of at least $10,000 within the supported safe integer range.',
+                                    MAXIMUM:'The maximum bounty is $1,000,000 for normal players.',
+                                    SELF_TARGET:'You cannot place a bounty on yourself.',
+                                    PLAYER_NOT_FOUND:'That player is not registered in Valkyrie.',
+                                    INSUFFICIENT_FUNDS:'Not enough cash to fund this bounty.',
+                                    DUPLICATE:'This bounty creation was already processed.',
+                                    MISSING_MESSAGE_ID:'Missing message ID. Send a new command.'
+                                };
+                                return sendText(sock,jid,errors[result.reason] || 'Bounty unavailable.');
+                            }
+                            const b = result.bounty;
+                            return sendText(sock,jid,`🎯 *BOUNTY #${b.id}*\nTarget: ${playerMention(mentioned)}\nReward: ${formatMoney(b.amount)}\nExpires in 24 hours. Cash escrowed.`,[mentioned]);
+                        }
+                        if (command === 'bountyinfo') {
+                            const id = Number(args[0]);
+                            if (args.length !== 1 || !/^[1-9][0-9]*$/.test(args[0]) || !Number.isSafeInteger(id)) return sendText(sock,jid,'Use .bountyinfo <id>.');
+                            const b = getBounty(id);
+                            if (!b) return sendText(sock,jid,'Bounty not found.');
+                            const claimant = b.claimant_id ? `\nClaimed by: ${playerMention(b.claimant_id)}` : '';
+                            return sendText(sock,jid,`🎯 *BOUNTY #${b.id}*\nTarget: ${playerMention(b.target_id)}\nCreator: ${playerMention(b.creator_id)}\nReward: ${formatMoney(b.amount)}\nStatus: ${b.status.toUpperCase()}\nExpires: ${new Date(b.expires_at).toISOString()}${claimant}`,
+                                [b.target_id,b.creator_id,b.claimant_id].filter(Boolean));
+                        }
+                        const page = args.length ? Number(args[0]) : 1;
+                        if (args.length > 1 || !Number.isSafeInteger(page) || page < 1 || page > 1000000) return sendText(sock,jid,`Use .${command} [page].`);
+                        const rows = listBounties(command === 'mybounties' ? userId : null,(page-1)*20);
+                        if (!rows.length) return sendText(sock,jid,'No bounties on this page.');
+                        return sendText(sock,jid,`🎯 *${command === 'mybounties' ? 'MY BOUNTIES' : 'ACTIVE BOUNTIES'}* — Page ${page}\n\n` +
+                            rows.map(b => `#${b.id} • ${playerMention(b.target_id)} • ${formatMoney(b.amount)} • ${b.status}`).join('\n') +
+                            (rows.length === 20 ? `\nNext: .${command} ${page+1}` : ''),rows.map(b => b.target_id));
+                    } catch (error) {
+                        console.error('Bounty action failed:',error);
+                        return sendText(sock,jid,'Bounty processing could not complete safely. Please try again.');
+                    }
+                }
                 if (command === 'medkit' || command === 'medic') {
                     if ((command === 'medkit' && args.length > 1) || (command === 'medic' && args.length)) {
                         return sendText(sock,jid,'Use .medkit [amount] or .medic.');
@@ -660,7 +737,7 @@ Use *.menu* to view your commands.
                     const shield = getEquippedShield(userId);
                     const status = isKamio(player)
                         ? "👑 HP: ∞ | Shield: ∞ (KAMIO immunity)"
-                        : `❤️ HP: ${player.health}/${getMaxHP(player.level)}\n🛡️ Shield: ${shield?.remaining || 0}`;
+                        : `❤️ HP: ${player.health}/${getMaxHP(player.level)}\n🛡️ Shield: ${shield ? `${shield.name} — ${shield.remaining}/${shield.absorption} absorption${shield.remaining === 0 ? ` (depleted). Replace with .buy ${shield.item_id}` : " (automatic against attacks)"}` : "None equipped. Use .equip <shield_id>"}`;
                     return sendText(sock, jid,
                         status + (isDefeated(player) ? "\n" + recoveryText(player) : "\nReady."));
                 }
@@ -680,7 +757,7 @@ Use *.menu* to view your commands.
                     const messageKey = msg.key.id
                         ? JSON.stringify([jid, userId, msg.key.id]) : null;
                     let result;
-                    try { result = executeAttack(userId, targetId, messageKey); }
+                    try { result = executeAttack(userId, targetId, messageKey, {attacker:attackSender.canonicalId,target:target.canonicalId}); }
                     catch (error) {
                         console.error('Attack failed:',error);
                         return sendText(sock,jid,'Attack could not be saved. No hit was applied. Try again.');
@@ -709,6 +786,10 @@ Use *.menu* to view your commands.
                             : `❤️ Target HP: ${result.health}/${result.maxHP} | Shield: ${result.shieldRemaining}`);
                     if (result.shieldDepleted) response += "\n🛡️ Shield depleted.";
                     if (result.defeated) response += "\n💀 Target defeated. Recovery in 10 minutes.";
+                    if (result.bountyClaims?.length) {
+                        const total = result.bountyClaims.reduce((sum,bounty) => sum + bounty.amount,0);
+                        response += `\n🎯 Bounties claimed: ${result.bountyClaims.length} | Reward: ${formatMoney(total)}`;
+                    }
                     return sendText(sock, jid, response + formatMissionCompletions(result.missionCompletions));
                 }
 
@@ -743,6 +824,9 @@ if (
     if (result.duplicate) return sendText(sock,jid,'✅ This equipment action was already processed.');
 
     if (!result.success) {
+        if (result.reason === "SHIELD_DEPLETED") {
+            return sendText(sock,jid,`🛡️ *${result.item.name}* is depleted and cannot protect you. Replace it with .buy ${itemId} at the normal shop price, then .equip ${itemId}.`);
+        }
         if (result.reason === "ITEM_NOT_OWNED") {
             return sendText(
                 sock,
@@ -770,7 +854,7 @@ if (
         sock,
         jid,
         command === "equip"
-            ? `✅ *${result.item.name}* equipped.`
+            ? `✅ *${result.item.name}* equipped.${result.item.shield_remaining != null ? `\n🛡️ ${result.item.shield_remaining} absorption remaining. Protects automatically against attacks; does not refill when re-equipped.` : ""}`
             : `✅ *${result.item.name}* unequipped.`
     );
 }
@@ -860,6 +944,10 @@ if (
 .medkit [amount]
 .medic
 .attack @player
+.bounty @player amount
+.bounties
+.bountyinfo <id>
+.mybounties
 .missions
 
 💰 *ECONOMY*
@@ -949,6 +1037,10 @@ View your profile.
 Check HP, shield absorption, and recovery.
 
 .attack @player
+.bounty @player amount
+.bounties
+.bountyinfo <id>
+.mybounties
 Attack a registered player (30-second cooldown).
 
 .balance
@@ -1069,6 +1161,10 @@ Use Medkits outside combat.
 Pay for a full heal outside combat.
 
 .attack @player
+.bounty @player amount
+.bounties
+.bountyinfo <id>
+.mybounties
 Attack another player.
 
 .balance
@@ -1556,9 +1652,8 @@ Progression rank: ${getRank(target.level)}`
                             );
                         }
 
-                        deletePlayer(
-                            targetId
-                        );
+                        const deleted = deletePlayer(targetId);
+                        if (!deleted.success) return sendText(sock,jid,'This account has active bounties and cannot be reset yet.');
 
                         return sendText(
                             sock,
@@ -2592,7 +2687,7 @@ ${lines}
                     if (!result.success) return sendText(sock,jid,result.reason === 'COOLDOWN'
                         ? `⏳ *WORK COOLDOWN*\nCome back in ${Math.ceil(result.remainingMs/1000)}s.`
                         : 'Missing message ID. Send a new command.');
-                    return sendText(sock,jid,`💼 *WORK COMPLETE*\nEarned: ${formatMoney(result.payout)}\nXP: +${result.xp}\nCash: ${formatMoney(result.balance)}` + levelUpText(result.progression, isKamio(player)));
+                    return sendText(sock,jid,`💼 *WORK COMPLETE*\nEarned: ${formatMoney(result.payout)}\nXP: +${result.xp}\nCash: ${formatMoney(result.balance)}` + levelUpText(result.progression, isKamio(player)) + formatMissionCompletions(result.missionCompletions));
                 }
 /*
 ==================================
@@ -2603,6 +2698,7 @@ DAILY REWARD
 if (
     command === "daily"
 ) {
+                    return persistMissionCommand(sock,jid,replyPlayerJid,userId,actionId,'daily',(queueReply,queuePlayerReply) => {
 
     /*
     Re-fetch the player immediately before
@@ -2617,7 +2713,7 @@ if (
         getPlayer(userId);
 
     if (!currentPlayer) {
-        return sendText(
+        return queueReply(
             sock,
             jid,
             "❌ Player data not found."
@@ -2657,7 +2753,7 @@ if (
                 (60 * 1000)
             );
 
-        return sendText(
+        return queueReply(
             sock,
             jid,
 
@@ -2692,7 +2788,7 @@ Come back in:
             1
         );
 
-    return sendText(
+    return queueReply(
         sock,
         jid,
 
@@ -2708,7 +2804,9 @@ ${formatMoney(newMoney)}
 
 ⏰ Come back tomorrow for another reward!${formatMissionCompletions(missionCompletions)}`
     );
-}
+
+                    });
+                }
 
                 /*
                 ==================================
@@ -2719,11 +2817,12 @@ ${formatMoney(newMoney)}
                 if (
                     command === "hack"
                 ) {
+                    return persistMissionCommand(sock,jid,replyPlayerJid,userId,actionId,'hack',(queueReply,queuePlayerReply) => {
                     const mentionedJid =
                         msg.message?.extendedTextMessage?.contextInfo?.mentionedJid?.[0];
 
                     if (!mentionedJid) {
-                        return sendText(
+                        return queueReply(
                             sock,
                             jid,
                             `❌ *HACK FAILED*\n\nMention the player you want to hack.\n\nExample:\n.hack @player`
@@ -2733,7 +2832,7 @@ ${formatMoney(newMoney)}
                     const targetId = mentionedJid;
 
                     if (targetId === userId) {
-                        return sendText(
+                        return queueReply(
                             sock,
                             jid,
                             `❌ You cannot hack yourself.`
@@ -2743,7 +2842,7 @@ ${formatMoney(newMoney)}
                     const target = getPlayer(targetId);
 
                     if (!target) {
-                        return sendText(
+                        return queueReply(
                             sock,
                             jid,
                             `❌ That player is not registered in Valkyrie.`
@@ -2760,7 +2859,7 @@ ${formatMoney(newMoney)}
                         !hackerDevice ||
                         Number(hackerDevice.quantity) < 1
                     ) {
-                        return sendText(
+                        return queueReply(
                             sock,
                             jid,
                             `❌ *HACK FAILED*\n\nYou don't have a 🟪 *Hacking Device*.\n\nBuy one from the market first.`
@@ -2771,7 +2870,7 @@ ${formatMoney(newMoney)}
                         Number(target.bank) || 0;
 
                     if (targetBank <= 0) {
-                        return sendText(
+                        return queueReply(
                             sock,
                             jid,
                             `❌ *HACK FAILED*\n\n@${targetId.split("@")[0]} has no money in their bank.\n\n🟪 Your Hacking Device was not consumed.`,
@@ -2820,7 +2919,7 @@ ${formatMoney(newMoney)}
                             1
                         );
 
-                    return sendText(
+                    return queueReply(
                         sock,
                         jid,
                         `🟪 *HACK SUCCESSFUL*\n\n` +
@@ -2833,16 +2932,19 @@ ${formatMoney(newMoney)}
                         formatMissionCompletions(missionCompletions),
                         [targetId]
                     );
+
+                    });
                 }
 
                 if (
                     command === "rob"
                 ) {
+                    return persistMissionCommand(sock,jid,replyPlayerJid,userId,actionId,'rob',(queueReply,queuePlayerReply) => {
                     const mentionedJid =
                         msg.message?.extendedTextMessage?.contextInfo?.mentionedJid?.[0];
 
                     if (!mentionedJid) {
-                        return sendText(
+                        return queueReply(
                             sock,
                             jid,
                             `❌ *ROBBERY FAILED*\n\nMention the player you want to rob.\n\nExample:\n.rob @player`
@@ -2852,7 +2954,7 @@ ${formatMoney(newMoney)}
                     const targetId = mentionedJid;
 
                     if (targetId === userId) {
-                        return sendText(
+                        return queueReply(
                             sock,
                             jid,
                             `❌ You cannot rob yourself.`
@@ -2862,7 +2964,7 @@ ${formatMoney(newMoney)}
                     const target = getPlayer(targetId);
 
                     if (!target) {
-                        return sendText(
+                        return queueReply(
                             sock,
                             jid,
                             `❌ That player is not registered in Valkyrie.`
@@ -2870,7 +2972,7 @@ ${formatMoney(newMoney)}
                     }
 
                     if (Number(target.money) < 100) {
-                        return sendText(
+                        return queueReply(
                             sock,
                             jid,
                             `❌ *ROBBERY FAILED*\n\nThat player does not have enough cash to rob.`
@@ -2908,7 +3010,7 @@ ${formatMoney(newMoney)}
                         requestedTool &&
                         !toolId
                     ) {
-                        return sendText(
+                        return queueReply(
                             sock,
                             jid,
                             `❌ *UNKNOWN ROBBERY TOOL*\n\nAvailable tools:\n🔑 lockpick\n🧤 gloves\n🎭 disguise\n🧰 breach\n📡 scanner\n🚗 getaway\n🖤 blackout`
@@ -2924,7 +3026,7 @@ ${formatMoney(newMoney)}
                         );
 
                         if (!tool || Number(tool.quantity) < 1) {
-                            return sendText(
+                            return queueReply(
                                 sock,
                                 jid,
                                 `❌ You don't have a *${toolId}* in your inventory.`
@@ -2942,7 +3044,7 @@ ${formatMoney(newMoney)}
                         getPlayer(userId);
 
                     if (!currentPlayer) {
-                        return sendText(
+                        return queueReply(
                             sock,
                             jid,
                             "❌ Player data not found."
@@ -2950,7 +3052,7 @@ ${formatMoney(newMoney)}
                     }
 
                     if (Number(currentPlayer.money) < 100) {
-                        return sendText(
+                        return queueReply(
                             sock,
                             jid,
                             "❌ You need at least $100 cash to attempt a robbery."
@@ -2966,7 +3068,7 @@ ${formatMoney(newMoney)}
                             (ROB_COOLDOWN - (now - lastRob)) / 1000
                         );
 
-                        return sendText(
+                        return queueReply(
                             sock,
                             jid,
                             `⏳ *ROBBERY COOLDOWN*\n\nTry again in *${remaining}s*.`
@@ -2979,14 +3081,13 @@ ${formatMoney(newMoney)}
                         last_rob: now
                     });
 
-                    // removeItem is synchronous and persists a single inventory mutation.
-                    // No await occurs between validation, consumption and this terminal branch,
-                    // so concurrent handlers cannot reuse a shield or continue this robbery.
+                    // The enclosing action commits cooldown and shield consumption together.
+                    // Replies are queued until the durable save succeeds.
                     if (removeItem(targetId, "aegis_shield", 1)) {
-                        return Promise.allSettled([
-                            sendPlayerReply(sock, targetId, targetId,
+                        return ([
+                            queuePlayerReply(sock, targetId, targetId,
                                 "🛡️ *AEGIS SHIELD ACTIVATED*\n\nYour Aegis Shield blocked a robbery and was consumed. No money was stolen."),
-                            sendText(sock, jid,
+                            queueReply(sock, jid,
                                 "🛡️ *ROBBERY BLOCKED*\n\nThe target's Aegis Shield blocked your robbery and was consumed. No money was stolen and no fine was charged.")
                         ]);
                     }
@@ -3005,7 +3106,7 @@ ${formatMoney(newMoney)}
                             ) / 1000
                         );
 
-                        return sendText(
+                        return queueReply(
                             sock,
                             jid,
                             `🛡️ *TARGET PROTECTED*\n\nThis player has recently survived several robbery attempts.\n\nTry again in *${seconds}s*.`
@@ -3199,7 +3300,7 @@ ${formatMoney(newMoney)}
                             missionCompletions
                         );
 
-                        return sendText(
+                        return queueReply(
                             sock,
                             jid,
                             message
@@ -3229,7 +3330,7 @@ ${formatMoney(newMoney)}
                         );
 
                     if (maxSteal < 100) {
-                        return sendText(
+                        return queueReply(
                             sock,
                             jid,
                             "❌ You need at least $100 cash to attempt a robbery."
@@ -3252,7 +3353,7 @@ ${formatMoney(newMoney)}
                         );
 
                     if (!robberyCompleted) {
-                        return sendText(
+                        return queueReply(
                             sock,
                             jid,
                             "❌ *ROBBERY FAILED*\\n\\nThe target's balance changed before the robbery completed."
@@ -3298,11 +3399,13 @@ ${formatMoney(newMoney)}
                         robberyMissionCompletions
                     );
 
-                    return sendText(
+                    return queueReply(
                         sock,
                         jid,
                         message
                     );
+
+                    });
                 }
 
             } catch (error) {

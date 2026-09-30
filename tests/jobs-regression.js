@@ -50,7 +50,8 @@ let db;
     assert.equal(d.jobs.claim('test','delivery','mission').reason,'DUPLICATE');
     const missions=d.getPlayerMissions('test');
     assert.equal(missions.find(m=>m.id==='job_test').progress,1);
-    assert(missions.filter(m=>m.id!=='job_test').every(m=>m.progress===0));
+    assert(missions.filter(m=>m.type!=='complete_job').every(m=>m.progress===0));
+    for (const id of ['jobs_25','jobs_100']) assert.equal(missions.find(m=>m.id===id).progress,1);
     console.log('PASS Jobs exact min/max payouts, RNG rollback, save rollback/retry, registration, missing ID, atomic mission reward and mission isolation');
 })().catch(e=>{console.error(e);process.exitCode=1;}).finally(()=>{
     if(db)db.close();process.chdir(cwd);

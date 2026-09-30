@@ -51,6 +51,23 @@ const MISSION_DEFINITIONS = [
     }
 ];
 
-module.exports = {
-    MISSION_DEFINITIONS
-};
+// New one-time milestones; existing IDs and progress remain untouched.
+const EXPANSION_MISSIONS = [
+    ['work_25', 'Honest Hustle', 'complete_work', 25, 1000, 'Complete 25 work shifts'],
+    ['work_100', 'Clockwork', 'complete_work', 100, 3000, 'Complete 100 work shifts'],
+    ['jobs_25', 'Reliable Worker', 'complete_job', 25, 2000, 'Complete 25 jobs'],
+    ['jobs_100', 'Career Builder', 'complete_job', 100, 5000, 'Complete 100 jobs'],
+    ['combat_5', 'Proven Fighter', 'win_attack', 5, 3000, 'Defeat 5 players'],
+    ['combat_20', 'Arena Regular', 'win_attack', 20, 8000, 'Defeat 20 players'],
+    ['robbery_5', 'Repeat Offender', 'complete_robbery', 5, 2000, 'Complete 5 successful robberies'],
+    ['robbery_20', 'Notorious', 'complete_robbery', 20, 6000, 'Complete 20 successful robberies'],
+    ['purchase_10', 'Stocking Up', 'buy_item', 10, 1000, 'Purchase 10 item units'],
+    ['purchase_50', 'Well Supplied', 'buy_item', 50, 3000, 'Purchase 50 item units'],
+    ['medkits_10', 'Field Recovery', 'use_item', 10, 1000, 'Consume 10 item units'],
+    ['medic_5', 'Regular Patient', 'use_medic', 5, 1500, 'Complete 5 medic visits'],
+    ['casino_25', 'Table Regular', 'play_casino', 25, 500, 'Complete 25 casino rounds']
+].map(([id,title,type,targetAmount,reward,requirement]) => ({
+    id,title,type,targetAmount,reward,requirement,description: requirement + '.',active: 1
+}));
+
+module.exports = { MISSION_DEFINITIONS, EXPANSION_MISSIONS };

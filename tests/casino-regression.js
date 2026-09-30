@@ -192,7 +192,7 @@ function fixture(p, dealer, deck = [9]) {
             const finisher = fighter+'-finisher'; d.createPlayer(finisher,'Finisher');
             d.addItem(finisher,weapon.id); d.equipItem(finisher,weapon.id);
             assert(d.executeAttack(finisher,victim,'finish-'+weapon.id).defeated);
-            assert.equal(d.getPlayerMissions(finisher).find(m=>m.type==='win_attack').rewarded,1);
+            assert.equal(d.getPlayerMissions(finisher).find(m=>m.id==='win_first_attack').rewarded,1);
             d.recoverPlayers(Date.now()+d.RECOVERY_DURATION+1000);
         }
     }

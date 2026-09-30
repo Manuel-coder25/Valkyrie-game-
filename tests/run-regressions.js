@@ -11,7 +11,7 @@ function protectedFiles(){
 const before=protectedFiles();let failed=false;
 try {
     const sources=['index.js','database.js','progression.js','missions.js','weapons.js','shields.js','jobs.js',
-        'casino.js','casino-commands.js','player-replies.js','healing.js','core-migration.js',
+        'casino.js','casino-commands.js','player-replies.js','healing.js','core-migration.js','expansion-migration.js',
         ...fs.readdirSync(__dirname).filter(n=>n.endsWith('.js')).map(n=>'tests/'+n)];
     for(const file of sources){const r=spawnSync(process.execPath,['--check',file],{cwd:root,encoding:'utf8'});
         if(r.status!==0)throw new Error(`${file}: ${r.stderr || r.error}`);}

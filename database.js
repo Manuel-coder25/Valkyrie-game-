@@ -9,6 +9,7 @@ const { SCHEMA: JOB_SCHEMA, createJobs } = require("./jobs");
 const {getMaxHP, getRank, validLevel, addXP} = require('./progression');
 const {MEDKIT, AEGIS, medkitHealing, medicPrice} = require('./healing');
 const {migrateCore} = require('./core-migration');
+const {migrateExpansion} = require('./expansion-migration');
 let db;
 let transactionDepth = 0;
 // Reuse synchronous SQL.js transactions. Nested inventory helpers defer saving.
@@ -370,6 +371,8 @@ async function initDatabase() {
     db.run(CASINO_SCHEMA);
     db.run(JOB_SCHEMA);
     atomic(() => migrateCore(db));
+    atomic(() => migrateExpansion(db));
+    expireBounties();
 
     console.log("✅ Database initialized");
 }
@@ -959,6 +962,8 @@ function equipItem(playerId, itemId, actionId) {
         if (!item || Number(item.quantity) <= 0) return {success:false,reason:'ITEM_NOT_OWNED'};
         const catalogue = isWeapon(itemId) ? WEAPON_CATALOGUE : isShield(itemId) ? SHIELD_CATALOGUE : null;
         if (!catalogue) return {success:false,reason:'ITEM_NOT_EQUIPPABLE'};
+        if (isShield(itemId) && item.shield_remaining !== null && Number(item.shield_remaining) <= 0)
+            return {success:false,reason:'SHIELD_DEPLETED',item};
         const ids = Object.keys(catalogue);
         db.run(`UPDATE player_inventory SET equipped = 0 WHERE player_id = ? AND item_id IN (${ids.map(() => '?').join(',')})`, [playerId,...ids]);
         if (isShield(itemId)) db.run(`UPDATE player_inventory SET shield_remaining = ?
@@ -1036,7 +1041,10 @@ function buyItem(playerId, itemId, quantity = 1, actionId) {
         if (!player) throw new Error('Player does not exist.');
         const item = getItem(itemId);
         if (!item || item.price <= 0 || ['market_test_item','inventory_test_item'].includes(itemId)) return {success:false,reason:'ITEM_NOT_FOUND'};
-        const currentQuantity = Number(getInventoryItem(playerId,itemId)?.quantity || 0);
+        const owned = getInventoryItem(playerId,itemId);
+        const replacingShield = isShield(itemId) && Number(owned?.quantity) > 0 &&
+            owned.shield_remaining !== null && Number(owned.shield_remaining) === 0;
+        const currentQuantity = replacingShield ? 0 : Number(owned?.quantity || 0);
         if (!item.stackable && currentQuantity > 0) return {success:false,reason:'ITEM_NOT_STACKABLE',item};
         if (currentQuantity + amount > item.max_quantity) return {success:false,reason:'MAX_QUANTITY',item};
         const total = item.price * amount;
@@ -1044,7 +1052,10 @@ function buyItem(playerId, itemId, quantity = 1, actionId) {
         if (player.money < total) return {success:false,reason:'INSUFFICIENT_FUNDS',item,total,balance:player.money};
         db.run('UPDATE players SET money = money - ? WHERE id = ? AND money >= ?', [total,playerId,total]);
         if (db.getRowsModified() !== 1) throw new Error('Purchase debit failed');
-        addItem(playerId,itemId,amount);
+        if (replacingShield) {
+            db.run('UPDATE player_inventory SET shield_remaining = ?, quantity = 1 WHERE player_id = ? AND item_id = ?',
+                [getShieldDefinition(itemId).absorption,playerId,itemId]);
+        } else addItem(playerId,itemId,amount);
         db.run('INSERT OR IGNORE INTO player_missions (player_id,mission_id) SELECT ?,id FROM missions WHERE active = 1', [playerId]);
         const missionCompletions = applyMissionProgress(playerId,'buy_item',amount,Date.now());
         return {success:true,item,quantity:amount,total,balance:getPlayer(playerId).money,missionCompletions};
@@ -1083,6 +1094,8 @@ function healPlayer(playerId, kind, amount = 1, actionId) {
         if (used) {
             db.run('INSERT OR IGNORE INTO player_missions (player_id,mission_id) SELECT ?,id FROM missions WHERE active = 1', [playerId]);
             missionCompletions = applyMissionProgress(playerId,'use_item',used,Date.now());
+        } else if (kind === 'medic') {
+            missionCompletions = recordMissionProgress(playerId,'use_medic',1);
         }
         return {success:true,used,cost,health,maxHP,healed:health-player.health,missionCompletions};
     });
@@ -1100,80 +1113,33 @@ function claimWork(playerId, actionId, now = Date.now()) {
         const progression = addXP(player.level,player.xp,xp);
         db.run('UPDATE players SET money = money + ?, xp = ?, level = ?, last_work = ? WHERE id = ?',
             [payout,progression.xp,progression.level,now,playerId]);
-        return {success:true,payout,xp,progression,balance:getPlayer(playerId).money};
+        const missionCompletions = recordMissionProgress(playerId,'complete_work',1);
+        return {success:true,payout,xp,progression,balance:getPlayer(playerId).money,missionCompletions};
     });
 }
 
-function completeRobbery(
-    attackerId,
-    targetId,
-    amount
-) {
+function completeRobbery(attackerId, targetId, amount) {
     const stolen = Number(amount);
+    if (!attackerId || !targetId || attackerId === targetId || !Number.isSafeInteger(stolen) || stolen <= 0) return false;
+    // The command's action transaction also includes tools, cooldown and missions.
+    const result = atomic(() => {
+        const target = getPlayer(targetId), attacker = getPlayer(attackerId);
+        if (!target || !attacker || isDefeated(attacker) || target.money < stolen) return {success:false};
+        if (!Number.isSafeInteger(target.money) || !Number.isSafeInteger(attacker.money + stolen)) throw new Error('Unsafe robbery balance');
+        db.run('UPDATE players SET money = money - ? WHERE id = ? AND money >= ?', [stolen,targetId,stolen]);
+        if (db.getRowsModified() !== 1) return {success:false};
+        db.run('UPDATE players SET money = money + ? WHERE id = ?', [stolen,attackerId]);
+        if (db.getRowsModified() !== 1) throw new Error('Robbery credit failed');
+        return {success:true};
+    });
+    return result.success;
+}
 
-    if (
-        !attackerId ||
-        !targetId ||
-        attackerId === targetId ||
-        !Number.isInteger(stolen) ||
-        stolen <= 0
-    ) {
-        return false;
-    }
-
-    db.run("BEGIN TRANSACTION");
-
-    try {
-        const target = getPlayer(targetId);
-        const attacker = getPlayer(attackerId);
-
-        if (
-            !target ||
-            !attacker ||
-            isDefeated(attacker) ||
-            Number(target.money) < stolen
-        ) {
-            db.run("ROLLBACK");
-            return false;
-        }
-
-        db.run(
-            `UPDATE players
-             SET money = money - ?
-             WHERE id = ?
-               AND money >= ?`,
-            [stolen, targetId, stolen]
-        );
-
-        if (db.getRowsModified() !== 1) {
-            db.run("ROLLBACK");
-            return false;
-        }
-
-        db.run(
-            `UPDATE players
-             SET money = money + ?
-             WHERE id = ?`,
-            [stolen, attackerId]
-        );
-
-        if (db.getRowsModified() !== 1) {
-            db.run("ROLLBACK");
-            return false;
-        }
-
-        db.run("COMMIT");
-        saveDatabase();
-        return true;
-    } catch (error) {
-        try {
-            db.run("ROLLBACK");
-        } catch (_) {
-            // Preserve the original database error.
-        }
-
-        throw error;
-    }
+// Reuse the existing action transaction for synchronous legacy command bodies.
+// Callbacks return reply data; WhatsApp sends happen only after durable save.
+function runGameplayAction(playerId, kind, actionId, operation) {
+    if (typeof actionId !== 'string' || !actionId) return {success:false,reason:'MISSING_MESSAGE_ID'};
+    return action(playerId,kind,actionId,operation);
 }
 
 function ensurePlayerMissions(playerId) {
@@ -1251,18 +1217,10 @@ function recordMissionProgress(
         return [];
     }
 
-    ensurePlayerMissions(playerId);
-
-    db.run("BEGIN TRANSACTION");
-    try {
-        const completions = applyMissionProgress(playerId, type, increment, Date.now());
-        db.run("COMMIT");
-        saveDatabase();
-        return completions;
-    } catch (error) {
-        try { db.run("ROLLBACK"); } catch (_) {}
-        throw error;
-    }
+    return atomic(() => {
+        ensurePlayerMissions(playerId);
+        return applyMissionProgress(playerId, type, increment, Date.now());
+    });
 }
 
 // Caller owns the transaction. Never saves or starts a nested transaction.
@@ -1347,6 +1305,8 @@ function applyMissionProgress(playerId, type, increment, now) {
                 continue;
             }
 
+            const balance = getPlayer(playerId)?.money;
+            if (!Number.isSafeInteger(balance) || !Number.isSafeInteger(balance + Number(reward))) throw new Error('Unsafe mission reward');
             db.run(
                 `UPDATE players
                  SET money = money + ?
@@ -1413,7 +1373,7 @@ function getEquippedShield(playerId) {
     };
 }
 
-function executeAttack(attackerId, targetId, messageKey) {
+function executeAttack(attackerId, targetId, messageKey, identities = {}) {
     if (!attackerId || !targetId || attackerId === targetId) {
         return { success: false, reason: "INVALID_TARGET" };
     }
@@ -1422,6 +1382,7 @@ function executeAttack(attackerId, targetId, messageKey) {
         return { success: false, reason: "MISSING_MESSAGE_ID" };
     }
     const now = Date.now();
+    expireBounties(now);
     recoverPlayers(now);
     return atomic(() => {
         const reject = (reason, extra = {}) => {
@@ -1474,8 +1435,9 @@ function executeAttack(attackerId, targetId, messageKey) {
         }
         db.run('UPDATE players SET combat_until = MAX(combat_until, ?) WHERE id IN (?,?)',
             [now + COMBAT_DURATION,attackerId,targetId]);
-        let missionCompletions = [];
+        let missionCompletions = [], bountyClaims = [];
         if (defeated) {
+            bountyClaims = claimDefeatBounties(attackerId,targetId,messageKey,now,identities);
             db.run(`INSERT OR IGNORE INTO player_missions (player_id, mission_id)
                 SELECT ?, id FROM missions WHERE active = 1`, [attackerId]);
             missionCompletions = applyMissionProgress(attackerId, "win_attack", 1, now);
@@ -1486,27 +1448,120 @@ function executeAttack(attackerId, targetId, messageKey) {
         return {
             success: true, weapon: weapon?.name || "Unarmed", baseDamage, damage, maxHP,
             shieldAbsorbed, shieldRemaining, healthDamage, health,
-            defeated, recoveryAt, immune, missionCompletions,
+            defeated, recoveryAt, immune, missionCompletions, bountyClaims,
             shieldDepleted: Boolean(!immune && shield && shield.remaining > 0 && shieldRemaining === 0)
         };
     });
 }
 
+function bountyRows(sql, params = []) {
+    const result = db.exec(sql,params)[0];
+    return result ? result.values.map(row => Object.fromEntries(result.columns.map((name,i) => [name,row[i]]))) : [];
+}
+function getBounty(id) { return bountyRows('SELECT * FROM bounties WHERE id = ?', [id])[0] || null; }
+function bountyHistory(id) { return bountyRows('SELECT * FROM bounty_events WHERE bounty_id = ? ORDER BY id', [id]); }
+function listBounties(creatorId = null, offset = 0) {
+    if (!Number.isSafeInteger(offset) || offset < 0) throw new Error('Invalid page');
+    return creatorId
+        ? bountyRows('SELECT * FROM bounties WHERE creator_id = ? ORDER BY id DESC LIMIT 20 OFFSET ?', [creatorId,offset])
+        : bountyRows("SELECT * FROM bounties WHERE status = 'active' ORDER BY expires_at,id LIMIT 20 OFFSET ?", [offset]);
+}
+function creditBountyCash(playerId, amount) {
+    const player = getPlayer(playerId);
+    if (!player || !Number.isSafeInteger(player.money) || !Number.isSafeInteger(amount) || !Number.isSafeInteger(player.money + amount)) {
+        throw new Error('Bounty payment exceeds safe cash balance or recipient is missing');
+    }
+    db.run('UPDATE players SET money = money + ? WHERE id = ?', [amount,playerId]);
+    if (db.getRowsModified() !== 1) throw new Error('Bounty payment failed');
+}
+function getReserveBalance() {
+    return Number(bountyRows('SELECT balance FROM valkyrie_reserve WHERE id = 1')[0]?.balance || 0);
+}
+function creditReserve(amount) {
+    const balance = getReserveBalance();
+    if (!Number.isSafeInteger(amount) || !Number.isSafeInteger(balance + amount)) {
+        throw new Error('Valkyrie Reserve exceeds safe cash balance');
+    }
+    db.run('UPDATE valkyrie_reserve SET balance = balance + ? WHERE id = 1', [amount]);
+    if (db.getRowsModified() !== 1) throw new Error('Valkyrie Reserve credit failed');
+}
+function bountyEvent(bounty, type, actor, recipient, now, source) {
+    db.run(`INSERT INTO bounty_events (bounty_id,event_type,actor_id,recipient_id,amount,timestamp,source_action_key)
+        VALUES (?,?,?,?,?,?,?)`, [bounty.id,type,actor,recipient,bounty.amount,now,source]);
+}
+function createBounty(creatorId, targetId, input, actionKey, identities = {}) {
+    if (typeof actionKey !== 'string' || !actionKey) return {success:false,reason:'MISSING_MESSAGE_ID'};
+    const amount = typeof input === 'number' ? input :
+        (typeof input === 'string' && /^[0-9]+$/.test(input) ? Number(input) : NaN);
+    if (!Number.isSafeInteger(amount) || amount < 10000) return {success:false,reason:'INVALID_AMOUNT'};
+    return atomic(() => {
+        if (bountyRows('SELECT id FROM bounties WHERE creation_action_key = ?', [actionKey]).length) {
+            return {success:false,reason:'DUPLICATE'};
+        }
+        const creator = getPlayer(creatorId), target = getPlayer(targetId);
+        if (!creator || !target) return {success:false,reason:'PLAYER_NOT_FOUND'};
+        const creatorIdentity = identities.creator || creatorId, targetIdentity = identities.target || targetId;
+        if (creatorId === targetId || creatorIdentity === targetIdentity) return {success:false,reason:'SELF_TARGET'};
+        if (creator.rank !== 'KAMIO' && amount > 1000000) return {success:false,reason:'MAXIMUM'};
+        if (!Number.isSafeInteger(creator.money) || creator.money < amount) return {success:false,reason:'INSUFFICIENT_FUNDS'};
+        const now = Date.now();
+        db.run('UPDATE players SET money = money - ? WHERE id = ? AND money >= ?', [amount,creatorId,amount]);
+        if (db.getRowsModified() !== 1) throw new Error('Bounty escrow failed');
+        db.run(`INSERT INTO bounties
+            (creator_id,target_id,creator_identity,target_identity,creator_name,target_name,amount,created_at,expires_at,creation_action_key)
+            VALUES (?,?,?,?,?,?,?,?,?,?)`,
+            [creatorId,targetId,creatorIdentity,targetIdentity,creator.name,target.name,amount,now,now+86400000,actionKey]);
+        const bounty = bountyRows('SELECT * FROM bounties WHERE creation_action_key = ?', [actionKey])[0];
+        bountyEvent(bounty,'created',creatorId,null,now,actionKey);
+        return {success:true,bounty};
+    });
+}
+function expireBounties(now = Date.now()) {
+    const due = bountyRows("SELECT * FROM bounties WHERE status = 'active' AND expires_at <= ? ORDER BY id", [now]);
+    if (!due.length) return [];
+    return atomic(() => {
+        const refunded = [];
+        for (const bounty of due) {
+            db.run("UPDATE bounties SET status = 'refunded', closed_at = ? WHERE id = ? AND status = 'active' AND expires_at <= ?", [now,bounty.id,now]);
+            if (db.getRowsModified() !== 1) continue;
+            creditReserve(bounty.amount);
+            bountyEvent(bounty,'expired',null,null,now,`expiry:${bounty.id}`);
+            refunded.push(bounty.id);
+        }
+        return refunded;
+    });
+}
+// Only executeAttack's defeat branch calls this; it owns the transaction.
+function claimDefeatBounties(attackerId, targetId, messageKey, now, identities) {
+    const attackerIdentity = identities.attacker || attackerId, targetIdentity = identities.target || targetId;
+    const eligible = bountyRows(`SELECT * FROM bounties WHERE status = 'active' AND expires_at > ?
+        AND (target_id = ? OR target_identity = ?) AND creator_id != ? AND creator_identity != ? ORDER BY id`,
+        [now,targetId,targetIdentity,attackerId,attackerIdentity]);
+    const claimed = [];
+    for (const bounty of eligible) {
+        db.run(`UPDATE bounties SET status = 'claimed', claimant_id = ?, attack_message_key = ?, closed_at = ?
+            WHERE id = ? AND status = 'active' AND expires_at > ?`, [attackerId,messageKey,now,bounty.id,now]);
+        if (db.getRowsModified() !== 1) continue;
+        creditBountyCash(attackerId,bounty.amount);
+        bountyEvent(bounty,'claimed',attackerId,attackerId,now,messageKey);
+        claimed.push({id:bounty.id,amount:bounty.amount});
+    }
+    return claimed;
+}
+
 function deletePlayer(id) {
-    db.run(
-        "DELETE FROM player_missions WHERE player_id = ?",
-        [id]
-    );
-
-    db.run(
-        "DELETE FROM players WHERE id = ?",
-        [id]
-    );
-
-    saveDatabase();
+    return atomic(() => {
+        if (bountyRows("SELECT id FROM bounties WHERE status = 'active' AND (creator_id = ? OR target_id = ?)",[id,id]).length) {
+            return {success:false,reason:'ACTIVE_BOUNTIES'};
+        }
+        db.run('DELETE FROM player_missions WHERE player_id = ?', [id]);
+        db.run('DELETE FROM players WHERE id = ?', [id]);
+        return {success:true};
+    });
 }
 
 module.exports = {
+    createBounty, expireBounties, getBounty, listBounties, bountyHistory, getReserveBalance, runGameplayAction,
     healPlayer,
     claimWork,
     jobs,
