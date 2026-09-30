@@ -17,6 +17,7 @@ const sock = {ev: {on: (event, callback) => { handlers[event] = callback; }},
 const context = vm.createContext({require: name => {
     if (name === '@whiskeysockets/baileys') return {default: () => sock,
         useMultiFileAuthState: async () => ({state: {}, saveCreds() {}})};
+    if (name === './whatsapp-lifecycle') return require('./lifecycle-routing-stub');
     if (name === 'pino') return () => ({});
     return require(path.join(root, name));
 }, console: {log() {}, error: (...args) => errors.push(args)},
@@ -72,7 +73,7 @@ async function command(text, sender = pn, alternate = lid) {
     const same = message('.job delivery');
     await Promise.all([dispatch([same]), dispatch([same])]);
     assert.equal(d.jobs.history(lid).length, 3);
-    d.updatePlayer(lid, {level:6, xp:3624});
+    d.updatePlayer(lid, {level:6, xp:2454});
     for (const job of JOBS.filter(j => j.id !== 'delivery')) {
         assert.match(await command('.job '+job.id), /JOB COMPLETE/);
         const h = d.jobs.history(lid)[0];

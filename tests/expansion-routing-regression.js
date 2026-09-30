@@ -15,6 +15,7 @@ fixture(async ({d,root,player,edit,advance,setNow}) => {
         sendMessage:async(jid,payload)=>{sent.push({jid,...payload});}};
     const context=vm.createContext({require:name=>{
         if(name==='@whiskeysockets/baileys') return {default:()=>sock,useMultiFileAuthState:async()=>({state:{},saveCreds(){}})};
+        if (name === './whatsapp-lifecycle') return require('./lifecycle-routing-stub');
         if(name==='pino') return ()=>({});
         return require(path.join(root,name));
     },console:{log(){},error:(...args)=>errors.push(args)},setTimeout,Date,

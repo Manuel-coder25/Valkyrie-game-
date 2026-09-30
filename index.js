@@ -45,6 +45,7 @@ const { COMMANDS: CASINO_COMMANDS, casinoCommand } = require("./casino-commands"
 const { jobCommand } = require("./jobs");
 
 const P = require("pino");
+const { createWhatsAppLifecycle } = require("./whatsapp-lifecycle");
 
 const PREFIX = ".";
 
@@ -225,211 +226,9 @@ async function startBot() {
         );
     }
 
-    /*
-    ==========================================
-    WHATSAPP AUTH
-    ==========================================
-    */
+}
 
-    const {
-        state,
-        saveCreds
-    } = await useMultiFileAuthState("./auth");
-const sock = makeWASocket({
-    auth: state,
-    logger: P({
-        level: "info"
-    }),
-    printQRInTerminal: false,
-    emitOwnEvents: true,
-    fireInitQueries: true,
-    defaultQueryTimeoutMs: 60000,
-    connectTimeoutMs: 60000,
-    keepAliveIntervalMs: 20000,
-    syncFullHistory: false
-});
-    sock.ev.on(
-        "creds.update",
-        saveCreds
-    );
-
-    let pairingRequested = false;
-
-    /*
-    ==========================================
-    CONNECTION
-    ==========================================
-    */
-
-    sock.ev.on(
-        "connection.update",
-        async (update) => {
-
-            const {
-                connection,
-                lastDisconnect
-            } = update;
-
-            if (connection === "connecting") {
-
-                console.log(
-                    "🔄 Connecting to WhatsApp..."
-                );
-
-                if (
-                    !state.creds.registered &&
-                    !pairingRequested
-                ) {
-
-                    pairingRequested = true;
-
-                    setTimeout(
-                        async () => {
-
-                            try {
-
-                                console.log(
-                                    "🔐 Requesting WhatsApp pairing code..."
-                                );
-
-                                const code =
-                                    await sock.requestPairingCode(
-                                        PHONE_NUMBER
-                                    );
-
-                                console.log("");
-                                console.log(
-                                    "================================"
-                                );
-                                console.log(
-                                    "🔐 WHATSAPP PAIRING CODE"
-                                );
-                                console.log(
-                                    "================================"
-                                );
-                                console.log(code);
-                                console.log(
-                                    "================================"
-                                );
-                                console.log("");
-
-                                console.log(
-                                    "📱 On WhatsApp:"
-                                );
-
-                                console.log(
-                                    "Settings → Linked Devices"
-                                );
-
-                                console.log(
-                                    "→ Link a Device"
-                                );
-
-                                console.log(
-                                    "→ Link with phone number instead"
-                                );
-
-                                console.log(
-                                    "→ Enter the code above"
-                                );
-
-                                console.log("");
-
-                            } catch (error) {
-
-                                pairingRequested = false;
-
-                                console.error(
-                                    "❌ Could not generate pairing code:"
-                                );
-
-                                console.error(error);
-                            }
-
-                        },
-                        3000
-                    );
-                }
-
-                return;
-            }
-
-            if (connection === "open") {
-
-                console.log("");
-                console.log(
-                    "================================"
-                );
-                console.log(
-                    "✅ VALKYRIE BOT CONNECTED"
-                );
-                console.log(
-                    "================================"
-                );
-                console.log("");
-
-                return;
-            }
-
-            if (connection === "close") {
-
-                const statusCode =
-                    lastDisconnect
-                        ?.error
-                        ?.output
-                        ?.statusCode;
-
-                console.log("");
-                console.log(
-                    "❌ WhatsApp connection closed."
-                );
-
-                console.log(
-                    "Status code:",
-                    statusCode || "unknown"
-                );
-
-                if (
-                    statusCode ===
-                    DisconnectReason.loggedOut
-                ) {
-
-                    console.log(
-                        "🚪 WhatsApp session logged out."
-                    );
-
-                    console.log(
-                        "Delete the auth folder and pair again."
-                    );
-
-                    return;
-                }
-
-                console.log(
-                    "🔄 Reconnecting in 5 seconds..."
-                );
-
-                setTimeout(
-                    () => {
-
-                        startBot().catch(
-                            (error) => {
-
-                                console.error(
-                                    "❌ Reconnection failed:"
-                                );
-
-                                console.error(error);
-                            }
-                        );
-
-                    },
-                    5000
-                );
-            }
-        }
-    );
-
+function attachMessages(sock, isCurrent) {
     /*
     ==========================================
     MESSAGES
@@ -3417,11 +3216,14 @@ ${formatMoney(newMoney)}
                 console.error(error);
             }
         };
-    sock.ev.on("messages.upsert", async ({ messages, type }) => {
+    const onMessages = async ({ messages, type }) => {
         for (const message of messages) {
+            if (!isCurrent()) return;
             await handleMessages({ messages: [message], type });
         }
-    });
+    };
+    sock.ev.on("messages.upsert", onMessages);
+    return () => sock.ev.off("messages.upsert", onMessages);
 }
 
 /*
@@ -3430,13 +3232,23 @@ START BOT
 ==========================================
 */
 
-startBot().catch(
-    (error) => {
-
-        console.error(
-            "❌ Failed to start bot:"
-        );
-
-        console.error(error);
+const lifecycle = createWhatsAppLifecycle({
+    useMultiFileAuthState,
+    makeWASocket,
+    DisconnectReason,
+    initialize: startBot,
+    attachMessages,
+    phoneNumber: PHONE_NUMBER,
+    socketOptions: {
+        logger: P({ level: "info" }),
+        printQRInTerminal: false,
+        emitOwnEvents: true,
+        fireInitQueries: true,
+        defaultQueryTimeoutMs: 60000,
+        connectTimeoutMs: 60000,
+        keepAliveIntervalMs: 20000,
+        syncFullHistory: false
     }
-);
+});
+lifecycle.installSignalHandlers();
+lifecycle.start().catch(error => console.error("Failed to start WhatsApp lifecycle:", error));

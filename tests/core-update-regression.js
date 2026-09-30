@@ -41,7 +41,7 @@ function failSave(operation, watched) {
     assert.deepEqual([p.addXP(50,900,1000).level,p.addXP(50,900,1000).xp],[50,1900]);
     assert.throws(()=>p.addXP(51,0,1),/Level/);
     assert.throws(()=>p.addXP(50,Number.MAX_SAFE_INTEGER,1),/XP/);
-    assert.equal(p.LEVELS.reduce((n,l)=>n+(l.xp||0),0),3170300);
+    assert.equal(p.LEVELS.reduce((n,l)=>n+(l.xp||0),0),2688380);
     console.log('PASS all 50 HP/XP/rank rows, strict HP growth, boundary levels, overflow and level-51 rejection');
 
     // Actual production snapshot, only in memory and a disposable directory.
@@ -112,7 +112,7 @@ function failSave(operation, watched) {
     player('level',1,60); d.updatePlayer('level',{level:2}); assert.equal(d.getPlayer('level').health,60);
     d.updatePlayer('level',{health:999}); assert.equal(d.getPlayer('level').health,108);
     d.updatePlayer('level',{level:1}); assert.equal(d.getPlayer('level').health,100);
-    d.updatePlayer('level',{health:60,xp:499});
+    d.updatePlayer('level',{health:60,xp:324});
     const work=d.claimWork('level','level-up'); assert.equal(work.progression.level,2); assert.equal(d.getPlayer('level').health,60);
     await d.initDatabase(); assert.equal(d.getPlayer('level').health,60,'migration must never reheal on restart');
     assert(d.claimWork('level','level-up').duplicate);

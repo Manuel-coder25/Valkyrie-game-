@@ -17,6 +17,7 @@ const sock = {ev: {on: (event, callback) => { handlers[event] = callback; }},
 const context = vm.createContext({require: name => {
     if (name === '@whiskeysockets/baileys') return {default: () => sock,
         useMultiFileAuthState: async () => ({state: {}, saveCreds() {}})};
+    if (name === './whatsapp-lifecycle') return require('./lifecycle-routing-stub');
     if (name === 'pino') return () => ({});
     return require(path.join(root, name));
 }, console: {log() {}, error: (...args) => errors.push(args)},
@@ -87,9 +88,9 @@ async function command(text, sender = pn, alternate = lid) {
     for(const healing of ['.medkit','.medkit 30','.medic']) assert.match(await command(healing,target,undefined),/Defeated/);
     const cash=d.getPlayer(target).money;
     now+=d.RECOVERY_DURATION+1;assert.match(await command('.health',target,undefined),/100\/100/);assert.equal(d.getPlayer(target).money,cash);
-    d.updatePlayer(lid,{level:1,xp:499,health:60});now+=30000;
+    d.updatePlayer(lid,{level:1,xp:324,health:60});now+=30000;
     text=await command('.job delivery');assert.match(text,/Level 2/);assert.match(text,/Rank: HUSTLER/);assert.match(text,/Maximum HP: 108/);assert.equal(d.getPlayer(lid).health,60);
-    d.updatePlayer(lid,{level:49,xp:185299});
+    d.updatePlayer(lid,{level:49,xp:174179});
     text=await command('.work');assert.match(text,/Level 50/);assert.match(text,/VALKYRIE LEGEND/);assert.match(text,/Maximum HP: 500/);assert.equal(d.getPlayer(lid).health,60);
     now+=10000;assert.match(await command('.work'),/WORK COMPLETE/);assert.equal(d.getPlayer(lid).level,50);
     assert.match(await command('.profile'),/Rank: VALKYRIE LEGEND/);
@@ -106,9 +107,9 @@ async function command(text, sender = pn, alternate = lid) {
     assert.match((await dispatch([wrappedHeal]))[0].text,/blocked during combat/);
     now+=60000;const wrappedMedic=message('.medic');wrappedMedic.message={ephemeralMessage:{message:wrappedMedic.message}};
     assert.match((await dispatch([wrappedMedic]))[0].text,/Healed/);
-    d.updatePlayer(kamio,{level:1,xp:499,health:50});
+    d.updatePlayer(kamio,{level:1,xp:324,health:50});
     text=await command('.work',kamio,undefined);assert.match(text,/Rank: KAMIO/);assert(!text.includes('Rank: HUSTLER'));
-    d.updatePlayer(kamio,{level:1,xp:499});
+    d.updatePlayer(kamio,{level:1,xp:324});
     text=await command('.job delivery',kamio,undefined);assert.match(text,/Rank: KAMIO/);
     assert.equal(d.getPlayer(kamio).health,50);
     // Each route uses the real messages.upsert callback with a fake socket;
